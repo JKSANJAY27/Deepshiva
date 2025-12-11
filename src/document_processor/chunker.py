@@ -1,10 +1,10 @@
 from typing import List
-from langchain.text_splitter import (
+from langchain_text_splitters import (
     RecursiveCharacterTextSplitter,
     TokenTextSplitter,
 )
 from langchain_experimental.text_splitter import SemanticChunker
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from config.settings import settings
 import tiktoken

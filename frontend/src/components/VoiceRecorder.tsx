@@ -1,9 +1,10 @@
 "use client";
 
 import React, { useRef, useState } from "react";
+import { Mic, Square } from "lucide-react";
 
 type Props = {
-  onTranscribed: (text: string, assistant?: unknown) => void;
+  onTranscribed: (text: string, language?: string) => void;
   onError?: (err: string) => void;
 };
 
@@ -30,7 +31,8 @@ export default function VoiceRecorder({ onTranscribed, onError }: Props) {
           fd.append("file", blob, "voice.webm");
 
           const token = localStorage.getItem("token");
-          const res = await fetch("/api/chat/voice", {
+
+          const res = await fetch("/api/transcribe", {
             method: "POST",
             headers: {
               'Authorization': `Bearer ${token}`
@@ -39,14 +41,17 @@ export default function VoiceRecorder({ onTranscribed, onError }: Props) {
           });
 
           if (!res.ok) {
+            if (res.status === 401) {
+              window.location.href = "/login";
+              return;
+            }
             const txt = await res.text();
             onError?.(`Upload error: ${res.status} ${txt}`);
             return;
           }
 
           const json = await res.json();
-          // Expecting: { text, assistant, audio_url }
-          onTranscribed(json.text, json.assistant);
+          onTranscribed(json.text, json.language);
 
           // 🔊 Auto-play TTS if available
           if (json.audio_url) {
@@ -86,12 +91,17 @@ export default function VoiceRecorder({ onTranscribed, onError }: Props) {
   return (
     <button
       onClick={() => (recording ? stopRecording() : startRecording())}
-      className={`p-3 rounded-2xl shadow-lg transition-all ${recording
-          ? "bg-red-500 hover:bg-red-600 text-white"
-          : "from-emerald-500 to-cyan-500 bg-gradient-to-r hover:from-emerald-600 hover:to-cyan-600 text-white"
+      className={`p-3.5 rounded-full shadow-lg transition-all duration-300 flex items-center justify-center group ${recording
+          ? "bg-accent text-white ring-4 ring-accent/20 animate-pulse"
+          : "bg-white text-primary-light border border-primary-light/20 hover:bg-primary hover:text-white hover:shadow-organic hover:-translate-y-0.5"
         }`}
+      title={recording ? "Stop Recording" : "Speak your query"}
     >
-      {recording ? "🛑 Stop" : "🎤 Speak"}
+      {recording ? (
+        <Square className="w-5 h-5 fill-current" />
+      ) : (
+        <Mic className="w-5 h-5" />
+      )}
     </button>
   );
 }

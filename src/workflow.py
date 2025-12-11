@@ -1,12 +1,14 @@
 """
-Main healthcare workflow
+Main healthcare workflow with multi-agent orchestration
 """
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, List
 from .config import HealthcareConfig
 from .chains import (
     GuardrailChain,
     IntentClassifierChain,
     SymptomCheckerChain,
+    ResponseFusionChain,
     GovernmentSchemeChain,
     MentalWellnessChain,
     YogaChain,
@@ -21,15 +23,16 @@ from .utils.emergency import HybridEmergencyDetector
 from .utils.youtube_client import search_videos
 
 class HealthcareWorkflow:
-    """Main workflow orchestrator for hybrid RAG/Search system"""
+    """Main workflow orchestrator for hybrid RAG/Search system with multi-agent support"""
     
     def __init__(self, config: HealthcareConfig):
         self.config = config
         
-        # Initialize all chains, PASSING THE CORRECT TOOL to each one.
+        # Initialize core chains
         self.guardrail = GuardrailChain(config.llm)
         self.classifier = IntentClassifierChain(config.llm)
         self.symptom_chain = SymptomCheckerChain(config.llm)
+        self.fusion_chain = ResponseFusionChain(config.llm)
         self.emergency_detector = HybridEmergencyDetector()
         
         # Profile Extractor
@@ -45,12 +48,15 @@ class HealthcareWorkflow:
         self.math_chain = MedicalMathChain(config.llm)
         self.validator = FactCheckerChain(config.llm)
         
-        # Agents using RAG get config.rag_retriever
-        self.ayush_chain = AyushChain(config.llm, config.rag_retriever)
-        self.yoga_chain = YogaChain(config.llm, config.rag_retriever)
+        # Agents using domain-specific RAG retrievers
+        yoga_retriever = config.get_retriever('yoga') or config.rag_retriever
+        ayush_retriever = config.get_retriever('ayush') or config.rag_retriever
+        
+        self.ayush_chain = AyushChain(config.llm, ayush_retriever)
+        self.yoga_chain = YogaChain(config.llm, yoga_retriever)
 
     async def run(self, user_input: str, query_for_classification: str, user_profile: Any = None) -> Dict[str, Any]:
-        """Execute the workflow"""
+        """Execute the workflow with multi-agent orchestration"""
         
 
 
@@ -88,21 +94,58 @@ class HealthcareWorkflow:
                 print("   ✓ Profile object updated in memory")
         
         # Step 1: Safety check
-        print("🛡️  [STEP 1/3] Running Safety Guardrail Check...")
+        print("🛡️  [STEP 1/4] Running Safety Guardrail Check...")
         safety_check = self.guardrail.check(query_for_classification)
         if not safety_check.get("is_safe", True):
             return {"status": "blocked", "reason": safety_check.get("reason")}
         print("   ✓ Content is safe\n")
         
-        # Step 2: Classify intent
-        print("🎯 [STEP 2/3] Classifying Intent...")
+        # Step 2: Classify intent (now returns multiple intents)
+        print("🎯 [STEP 2/4] Classifying Intent...")
         classification = self.classifier.run(query_for_classification)
-        intent = classification.get("classification")
-        print(f"   → Intent: {intent}\n")
+        primary_intent = classification.get("primary_intent")
+        all_intents = classification.get("all_intents", [])
+        is_multi_domain = classification.get("is_multi_domain", False)
         
-        # Step 3: Route to appropriate chain (using the clean user_input)
-        print(f"🔗 [STEP 3/3] Executing Chain for '{intent}'...")
-        result = {"intent": intent, "reasoning": classification.get("reasoning"), "output": None, "profile_updated": bool(profile_update)}
+        print(f"   → Primary Intent: {primary_intent}")
+        if is_multi_domain:
+            print(f"   → Multi-domain query detected: {len(all_intents)} intents")
+            for intent_obj in all_intents:
+                print(f"      - {intent_obj['intent']} (confidence: {intent_obj['confidence']:.2f})")
+        print()
+        
+        # Step 3: Execute agent(s)
+        if is_multi_domain and len(all_intents) > 1:
+            # Multi-agent execution with fusion
+            result = await self._execute_multi_agent(user_input, all_intents, classification)
+        else:
+            # Single agent execution (legacy path)
+            result = await self._execute_single_agent(user_input, primary_intent, classification)
+        
+        # Step 4: Validate Medical Advice
+        intent_to_check = result.get("intent")
+        output_content = result.get("output")
+        if intent_to_check in ["symptom_checker", "ayush_support", "health_advisory"] or (isinstance(output_content, str) and "symptom" in output_content.lower()):
+             if isinstance(output_content, str):
+                print("🩺 [STEP 4/4] Validating Medical Advice...")
+                validation = self.validator.validate(user_input, output_content)
+                if not validation.get("is_safe", True):
+                    print(f"   ⚠️ Unsafe content detected: {validation.get('reason')}")
+                    result["output"] = validation.get("revised_response") or "I cannot provide a response to this query due to safety concerns. Please consult a doctor immediately."
+                    result["validation_status"] = "blocked"
+                else:
+                    print("   ✓ Validation passed")
+
+        # Check if workflow updated the profile (pass back to API)
+        result["profile_updated"] = bool(profile_update)
+
+        print("   ✓ Workflow execution complete\n")
+        return result
+    
+    async def _execute_single_agent(self, user_input: str, intent: str, classification: Dict) -> Dict[str, Any]:
+        """Execute a single agent (legacy behavior)"""
+        print(f"🔗 [STEP 3/4] Executing Single Agent for '{intent}'...\n")
+        result = {"intent": intent, "reasoning": classification.get("reasoning"), "output": None, "is_multi_domain": False}
         
         if intent == "government_scheme_support":
             result["output"] = self.gov_scheme_chain.run(user_input)
@@ -115,12 +158,8 @@ class HealthcareWorkflow:
             result["output"] = f"**Calculation Result:** {math_result.get('result')}\n\n**Steps:**\n" + "\n".join([f"- {s}" for s in math_result.get('steps', [])])
             
         elif intent == "mental_wellness_support":
-            wellness_res = self.mental_wellness_chain.run(user_input)
-            yoga_res = self.yoga_chain.run(user_input)
-            
-            result["output"] = f"{wellness_res}\n\n### 🧘 Yoga for Mental Wellness\n{yoga_res}"
-            
-            # Add YouTube videos for Yoga
+            result["output"] = self.mental_wellness_chain.run(user_input)
+            result["yoga_recommendations"] = self.yoga_chain.run(user_input)
             try:
                 videos = await search_videos(f"yoga for mental wellness {user_input}")
                 result["yoga_videos"] = videos
@@ -129,6 +168,14 @@ class HealthcareWorkflow:
             
         elif intent == "ayush_support":
             result["output"] = self.ayush_chain.run(user_input)
+        
+        elif intent == "yoga_support":
+            result["output"] = self.yoga_chain.run(user_input)
+            try:
+                videos = await search_videos(f"yoga {user_input}")
+                result["yoga_videos"] = videos
+            except Exception as e:
+                print(f"⚠️ Failed to fetch YouTube videos: {e}")
             
         elif intent == "symptom_checker":
             result.update(await self._handle_symptoms(user_input))
@@ -139,26 +186,115 @@ class HealthcareWorkflow:
         else:
             result["output"] = "I couldn't understand your request. Please try rephrasing."
         
-        print("   ✓ Chain execution complete\n")
-        
-        # Step 4: Validate Medical Advice
-        if intent in ["symptom_checker", "ayush_support", "health_advisory"] or (isinstance(result.get("output"), str) and "symptom" in result["output"].lower()):
-            output_content = result.get("output")
-            # Handle dictionary output (e.g. from symptom checker)
-            if isinstance(output_content, dict):
-                 # For now, just skip complex dict validation or validate the 'message' part
-                 pass 
-            elif isinstance(output_content, str):
-                print("🩺 [STEP 4/4] Validating Medical Advice...")
-                validation = self.validator.validate(user_input, output_content)
-                if not validation.get("is_safe", True):
-                    print(f"   ⚠️ Unsafe content detected: {validation.get('reason')}")
-                    result["output"] = validation.get("revised_response") or "I cannot provide a response to this query due to safety concerns. Please consult a doctor immediately."
-                    result["validation_status"] = "blocked"
-                else:
-                    print("   ✓ Validation passed")
 
         return result
+    
+    async def _execute_multi_agent(self, user_input: str, all_intents: List[Dict], classification: Dict) -> Dict[str, Any]:
+        """Execute multiple agents in parallel and fuse their responses"""
+        print(f"🔗 [STEP 3/4] Executing Multi-Agent Orchestration...")
+        print(f"   → Running {len(all_intents)} agents in parallel...\n")
+        
+        # Filter intents with confidence > threshold
+        CONFIDENCE_THRESHOLD = 0.6
+        relevant_intents = [
+            intent_obj for intent_obj in all_intents 
+            if intent_obj['confidence'] >= CONFIDENCE_THRESHOLD
+        ]
+        
+        if not relevant_intents:
+            # Fallback to primary intent
+            primary = classification.get("primary_intent")
+            return await self._execute_single_agent(user_input, primary, classification)
+        
+        # Start YouTube video search early (if yoga is involved) - runs in parallel with agents
+        youtube_task = None
+        if any('yoga' in intent_obj['intent'] for intent_obj in relevant_intents):
+            print(f"   🎥 Launching YouTube search in parallel...")
+            youtube_task = asyncio.create_task(search_videos(f"yoga {user_input}"))
+        
+        # Execute agents in parallel
+        agent_tasks = []
+        intent_names = []
+        
+        for intent_obj in relevant_intents:
+            intent = intent_obj['intent']
+            intent_names.append(intent)
+            print(f"   🤖 Launching {intent.replace('_', ' ').title()} Agent...")
+            # Wrap synchronous agent calls in executor for true parallelism
+            agent_tasks.append(asyncio.to_thread(self._run_agent_sync, intent, user_input))
+        
+        print(f"   ⏳ Waiting for {len(agent_tasks)} agents to complete...\n")
+        
+        # Gather results in parallel
+        responses = await asyncio.gather(*agent_tasks, return_exceptions=True)
+        
+        # Build response dict
+        agent_responses = {}
+        for intent, response in zip(intent_names, responses):
+            if isinstance(response, Exception):
+                print(f"   ❌ Agent {intent} failed: {response}")
+            elif response:
+                print(f"   ✅ {intent.replace('_', ' ').title()} Agent completed")
+                agent_responses[intent] = response
+            else:
+                print(f"   ⚠️  {intent.replace('_', ' ').title()} Agent returned empty response")
+        
+        print(f"   → Collected {len(agent_responses)} agent responses\n")
+        
+        # Step 4: Fuse responses
+        print("🔀 [STEP 4/4] Fusing Agent Responses...\n")
+        if len(agent_responses) > 1:
+            fused_output = self.fusion_chain.fuse(user_input, agent_responses)
+        else:
+            # Only one response, use it directly
+            fused_output = list(agent_responses.values())[0] if agent_responses else "No response generated."
+        
+        result = {
+            "intent": classification.get("primary_intent"),
+            "all_intents": all_intents,
+            "is_multi_domain": True,
+            "reasoning": classification.get("reasoning"),
+            "output": fused_output,
+            "individual_responses": agent_responses  # For debugging/transparency
+        }
+        
+        # Wait for YouTube results (if started)
+        if youtube_task:
+            try:
+                print(f"   🎥 Waiting for YouTube results...")
+                videos = await youtube_task
+                result["yoga_videos"] = videos
+                print(f"   ✅ YouTube search completed")
+            except Exception as e:
+                print(f"   ⚠️ YouTube search failed: {e}")
+        
+        return result
+    
+    def _run_agent_sync(self, intent: str, user_input: str) -> str:
+        """Run a specific agent synchronously (will be called in thread pool)"""
+        try:
+            agent_name = intent.replace('_', ' ').title()
+            
+            if intent == "government_scheme_support":
+                print(f"      [{agent_name}] Using Web Search...")
+                return self.gov_scheme_chain.run(user_input)
+            elif intent == "mental_wellness_support":
+                print(f"      [{agent_name}] Using Web Search...")
+                return self.mental_wellness_chain.run(user_input)
+            elif intent == "ayush_support":
+                print(f"      [{agent_name}] Using RAG → ayush_collection")
+                return self.ayush_chain.run(user_input)
+            elif intent == "yoga_support":
+                print(f"      [{agent_name}] Using RAG → yoga_collection")
+                return self.yoga_chain.run(user_input)
+            elif intent == "facility_locator_support":
+                print(f"      [{agent_name}] Using Web Search...")
+                return self.hospital_chain.run(user_input)
+            else:
+                return None
+        except Exception as e:
+            print(f"      ❌ Error in {intent} agent: {e}")
+            return None
     
     async def _handle_symptoms(self, user_input: str) -> Dict[str, Any]:
         """Handle symptom checking with multi-agent follow-up"""
