@@ -58,8 +58,10 @@ Available categories:
 6. **facility_locator_support**: Finding hospitals, clinics, doctors, PHCs, healthcare facilities nearby
 7. **health_advisory**: Questions about disease outbreaks, health alerts (heatwave, dengue, covid), pollution updates, or vaccination drives.
 8. **medical_calculation**: Dosage calculations, BMI, drip rates, unit conversions.
+9. **general_conversation**: Greetings, casual chat, thank you, non-healthcare queries
 
 **IMPORTANT**: 
+- For greetings (hi, hello, namaste, hey) or casual chat → general_conversation
 - For common ailments (cold, cough, headache, fever, etc.), ALWAYS include BOTH yoga_support AND ayush_support with high confidence
 - Yoga and Ayurveda are complementary - most health queries benefit from both approaches
 - If a query mentions MULTIPLE domains, return ALL of them with confidence scores
@@ -67,6 +69,8 @@ Available categories:
 - A query can have 1-3 relevant intents
 
 **Examples**:
+- "hello" → general_conversation (1.0)
+- "thank you" → general_conversation (1.0)
 - "I have a cold" → ayush_support (0.9), yoga_support (0.85)
 - "I have anxiety and want yoga and herbal remedies" → yoga_support (0.9), ayush_support (0.9), mental_wellness_support (0.8)
 - "Find hospitals near me" → facility_locator_support (1.0)
@@ -144,32 +148,22 @@ class ResponseFusionChain:
     def __init__(self, llm):
         self.llm = llm
         self.prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a response synthesis agent for a multi-domain healthcare system.
+            ("system", """You are a response synthesis agent. Combine multiple agent responses into ONE coherent answer.
 
-Your task is to combine responses from multiple specialized agents into ONE coherent, well-structured answer.
+**Rules**:
+1. Remove redundancies
+2. Organize by topic (Yoga, Ayurveda, etc.)
+3. Keep all [Source: filename] citations
+4. Be concise - max 200 words
+5. Natural flow, not separate sections
 
-**Guidelines**:
-1. **Remove redundancies** - Don't repeat the same information
-2. **Organize logically** - Group related recommendations together
-3. **Preserve all citations** - Keep [Source: filename] references intact
-4. **Create natural flow** - Make it read as one unified response, not separate parts
-5. **Prioritize by relevance** - Put most important information first
-6. **Be comprehensive** - Include all unique insights from each agent
-7. **Maintain professional tone** - Healthcare-appropriate language
+Return unified response as plain text."""),
+            ("user", """Query: {query}
 
-**Structure**:
-- Start with a brief acknowledgment of the user's query
-- Organize by modality (e.g., Yoga Practices, Ayurvedic Remedies, Professional Resources)
-- Use clear section headings if multiple domains
-- End with any safety notes or disclaimers
-
-Return a well-formatted, coherent response as plain text."""),
-            ("user", """Original Query: {query}
-
-Agent Responses:
+Responses:
 {agent_responses}
 
-Synthesize these into ONE unified, coherent response.""")
+Synthesize briefly.""")
         ])
     
     def fuse(self, user_query: str, agent_responses: Dict[str, str]) -> str:
